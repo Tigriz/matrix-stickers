@@ -1,0 +1,778 @@
+#!/bin/bash
+
+shopt -s nocasematch    # Case insensitive
+
+STPKG_CONF_FILE=~/.config/stpkg.sh
+BASE_DIR="$PWD"
+
+# Detect install
+if [ "x$1" = "x-install" ]; then
+    INSTALL="yes"
+fi
+
+if [ "x$STPKG_COLORS" = "x" ]; then
+    STPKG_COLORS="yes"
+    error() { __red    "$*\n" >/dev/stderr; }
+    warn()  { __yellow "$*\n" >/dev/stderr; }
+    info()  { __green  "$*\n" >/dev/stderr; }
+
+    __red()     { echo -ne '\e[31m'$*'\e[0m'; }
+    __green()   { echo -ne '\e[32m'$*'\e[0m'; }
+    __yellow()  { echo -ne '\e[33m'$*'\e[0m'; }
+
+    __bold()      { echo -ne '\033[1m'$*'\e[0m'; }
+    __italic()    { echo -ne '\033[3m'$*'\e[0m'; }
+    __underline() { echo -ne '\033[4m'$*'\e[0m'; }
+else
+    STPKG_COLORS="no"
+    error() { echo 'ERROR:' $* >/dev/stderr; }
+    warn()  { echo 'WARN:'  $* >/dev/stderr; }
+    info()  { echo 'INFO:'  $* >/dev/stderr; }
+
+    alias __red=echo
+    alias __green=echo
+    alias __yellow=echo
+
+    alias __bold=echo
+    alias __italic=echo
+    alias __underline=echo
+fi
+
+die() {
+    error $*
+    exit 1
+}
+
+# Be paranoid
+REQUIREMENTS=""
+require() {
+    for CMD in $*; do
+        local __cmd=`which $1`
+        [ $? -ne 0 ] && die "Failed to find the '$1' command"
+        REQUIREMENTS="$CMD $REQUIREMENTS"
+    done
+}
+require \
+    md5sum mktemp column uuidgen convert montage identify python curl \
+    sed tr git sponge ls find jq chmod cat expr iconv
+__grep=`which egrep`
+if [ $? -ne 0 ]; then
+    __grep=`which grep`
+    [ $? -ne 0 ] && die "Failed to find 'grep' or 'egrep'"
+    warn "Cound not find 'egrep', will use 'grep' instead." \
+         "Please, note that some functionalities may not work with regular expressions."
+fi
+
+SELF=`readlink -f "$0"`
+MD5=`md5sum $SELF`
+
+# Source conf file, may have the sshfs hook
+[ -f $STPKG_CONF_FILE ] && source $STPKG_CONF_FILE
+
+if [ "x$STPKG_NO_MSG" = "xyes" -a ! "x$1" = "x-install" -a ! "x$1" = "xupdate" ]; then
+    # Do not silence errors
+    warn()  { return 0; }
+    info()  { return 0; }
+fi
+
+# Home server
+STPKG_HOMESERV=${STPKG_HOMESERV:="matrix.org"}
+STPKG_HOMESERV=`echo "$STPKG_HOMESERV" | iconv -c -t ascii//TRANSLIT | sed -e 's/^http:\/\/|^https:\/\///g' -e 's/^-+|-+$//g'`
+
+########################
+# Some basic functions #
+########################
+
+__exit() { cd "$BASE_DIR"; exit $1; }
+__EXIT() { cd "$BASE_DIR"; }
+trap __exit EXIT
+alias exit=__exit
+
+usage() {
+    local BASE_NAME=$(basename $0)
+    echo `__bold "$BASE_NAME usage:"`
+    local BASE_NAME=`__green "$BASE_NAME"`
+cat << EOF
+    $BASE_NAME -install [`__yellow "-sshfs 'username@server' -local mnt_point"`] [`__yellow "install_path"`]
+    $BASE_NAME show
+    $BASE_NAME help
+    $BASE_NAME update
+    $BASE_NAME list [`__yellow "-p -e -np"`] [`__yellow "bash_regex"`]
+    $BASE_NAME add|del <`__yellow "pack"`>
+    $BASE_NAME pack [`__yellow "-t token"`] [`__yellow "name"`] <`__yellow "pack_folder"`>
+    $BASE_NAME display [`__yellow "-dl folder"`] <`__yellow "pack_name"`> [`__yellow "sticker_regex"`]
+    $BASE_NAME edit <`__yellow "pack_name"`> add|del <`__yellow "sticker"`> [`__yellow "file"`]
+
+`__bold Flags:`
+    `__yellow "-e"` / `__yellow "-ne"`    The pack is enabled / disabled
+    `__yellow "-p"` / `__yellow "-np"`    The pack is present / not present in the sticker repo
+    `__yellow "-t"`          Matrix user token
+    `__yellow "-dl"`         Specify a folder to dl, may exists or not
+
+`__bold Configuration variables from $(echo '~/.config/stpkg.sh'):`
+    `__green STPKG_INSTALL`  [`__italic 'path'`]      The cloned stickerpicker project location. [$(__yellow `__italic '~/html/stickerpicker'`)]
+    `__green STPKG_BASE`     [`__italic 'path'`]      Where the sticker project is located.
+    `__green STPKG_COLORS`   [`__italic "yes|no"`]    Use colors for output. [$(__yellow `__italic "yes"`)]
+    `__green STPKG_NO_MSG`   [`__italic "yes|no"`]    Disable messages, no 'info' or 'warn'. [$(__yellow `__italic 'no'`)]
+    `__green STPKG_TOKEN`    [`__italic 'token'`]     The Matrix access token. $(__red `__bold \! Sensitive data \!`)
+    `__green STPKG_HOMESERV` [`__italic 'homeserv'`]  The Matrix home server. [$(__yellow `__italic 'iiens.net'`)]
+
+`__bold Notes:`
+    The `__italic "$(__yellow 'stpkg -install [path]')"` must be called only once. The default install
+    path is `__italic "$(__yellow '~/html/stickerpicker')"`. This command will give you a `__italic $(__yellow STPKG_INSTALL)`
+    and a `__italic $(__yellow STPKG_BASE)` env that you must put in your bashrc for the rest of the
+    stpkg commands to work.
+
+`__bold Requirements:`
+    The stpkg command requires `__italic $(__yellow 'egrep')`. If `__italic $(__yellow 'egrep')` is not found, `__italic $(__yellow 'grep')` will be
+    used instead. Here is a list of all the requirements:
+    $REQUIREMENTS
+EOF
+    exit 0
+}
+
+slugify() {
+    echo "$1" | \
+        iconv -c -t ascii//TRANSLIT | \
+        sed -e 's/[~^]+//g' -e 's/[^a-zA-Z0-9]+/-/g' -e 's/^-+|-+$//g' | \
+        tr A-Z a-z
+}
+
+default_index() {
+    jq -n "{ \"homeserver_url\": \"https://matrix.iiens.net\", \"packs\": [ \"scalar-privacy_pam.json\" ] }"
+}
+
+validate_token_internal() {
+    curl -s -X POST "https://$STPKG_HOMESERV/_matrix/media/r0/upload?access_token=$STPKG_TOKEN" | \
+        python3 -c "import sys, json; print(json.load(sys.stdin)['errcode'])" # TODO: Use jq here
+}
+
+validate_token() {
+    local RES=`validate_token_internal`
+    [ "x$RES" = "xM_UNKNOWN_TOKEN" ] && die "The token is incorrect or doesn't exist on '$STPKG_HOMESERV'"
+    [ ! "x$RES" = "xM_UNKNOWN" ]     && die "Got an 'yet implemented' error"
+    info "Token is valid on homeserv '$STPKG_HOMESERV'"
+}
+
+validate_homeserv() {
+    curl "https://$STPKG_HOMESERV" >/dev/null 2>&1
+    [ $? -ne 0 ] && die "Homeserv '$STPKG_HOMESERV' doesn't exist or is inaxessible"
+}
+
+file_get_width() {
+    local WIDTH=$(identify -format "%w" "$1") >/dev/null
+    local WIDTH=$(( $WIDTH  > 256 ? 256 : $WIDTH ))
+    echo "$WIDTH"
+}
+
+file_get_height() {
+    local HEIGHT=$(identify -format "%h" "$1") >/dev/null
+    local HEIGHT=$(( $HEIGHT > 256 ? 256 : $HEIGHT ))
+    echo "$HEIGHT"
+}
+
+file_get_type() { [[ "$1" == *.gif ]] && echo 'gif' || echo 'png'; }
+file_get_name() { echo "$1" | cut -f1 -d'.'; }
+
+upload_file() {
+    local TYPE=$1   # The type of file (png/gif)
+    local FILE=$2   # The file
+    local NAME=$3   # The pretty name for the sticker
+    # TODO: Use jq here
+    curl -s -X POST -H \
+        "Content-Type: image/$TYPE" --data-binary "@$DEST" "https://$STPKG_HOMESERV/_matrix/media/r0/upload?access_token=$STPKG_TOKEN" | \
+        tee /tmp/toto | python -c "import sys, json; print(json.load(sys.stdin)['content_uri'])"
+    [ $? -ne 0 ] && die "Failed to upload sticker $NAME for pack $PACK_NAME to $STPKG_HOMESERV"
+}
+
+picture_process_sticker() {
+    # NOTE: This command will display some progress dots...
+
+    local FILE=$1   # The source file
+    local DEST=$2   # The destination file
+    local NAME=$3   # The pretty name of the sticker
+    local WIDTH=$4  # The WIDTH!
+    local HEIGHT=$5 # The HEIGHT!
+    local TYPE=$6   # The type of the file (png/gif)
+
+    local OPTS=`[ "$TYPE" = "png" ] && echo '-type TrueColor PNG32:' || echo ' -coalesce '`
+
+    info "File '$FILE' => '$DEST' ($TYPE) | OPTS = '$OPTS'"
+
+    convert "$FILE" -bordercolor none -border 1 "$DEST" 1>&2    && progress_dot || die "$NAME failed on border"
+    convert "$DEST" -trim +repage "$DEST" 1>&2                  && progress_dot || die "$NAME failed on trim"
+    convert -background none -gravity center "$DEST" -resize "${WIDTH}x${HEIGHT}" $OPTS"$DEST" 1>&2 \
+        && progress_dot \
+        || die "$NAME failed on ${WIDTH}x${HEIGHT} resize"
+}
+
+picture_resize_preview() {
+    local DEST=$1   # The file
+    local NAME=$2   # The pretty name for the sticker
+    convert "$DEST" -resize "128x128" "$DEST" 1>&2 && progress_dot || die "$NAME failed at 128x128 resize"
+}
+
+create_sticker_json() {
+    local PACK_NAME=$1  # Pack name
+    local NAME=$2       # Pretty name for the sticker
+    local WIDTH=$3      # The WIDTH!
+    local HEIGHT=$4     # The HEIGHT!
+    local TYPE=$5       # The type of the picture (png/gif)
+    local MXC=$6        # The MXC URL
+
+    echo -n "{\"body\":\"$NAME\",\"info\":{\"mimetype\":\"image/$TYPE\",\"h\":$HEIGHT," \
+            "\"w\":$WIDTH,\"thumbnail_url\":\"$MXC\"},\"msgtype\":\"m.sticker\",\"url\":\"$MXC\"" \
+            ",\"id\":\"$PACK_NAME-$NAME\"}"
+}
+
+mxc_to_https() {
+    # The transformation is the following
+    # `mxc://<serv>/<id>` => `https://<serv>/_matrix/media/r0/download/<serv>/<id>`
+    # It seems that every requests should be made to matrix.org...
+    # `mxc://<serv>/<id>` => `https://matrix.org/_matrix/media/r0/download/<serv>/<id>`
+    local SERV=`echo "$1" | awk -F/ '{print $3}'`
+    local ID=`echo "$1" | awk -F/ '{print $4}'`
+    echo "https://matrix.org/_matrix/media/r0/download/$SERV/$ID"
+}
+
+################################
+# The special install function #
+################################
+
+__install() {
+    # Parse options
+    local PARSE_FLAGS=1
+    while [ $PARSE_FLAGS -eq 1 ]; do
+        case "$1" in
+            -sshfs)
+                local SSHFS="$2"
+                shift 2
+                ;;
+            -local)
+                local MNT="$2"
+                shift 2
+                ;;
+            *)
+                local PARSE_FLAGS=0
+                ;;
+        esac
+    done
+
+    # Create the ~/config/stpkg.sh
+    [ ! -d ~/config ] && mkdir ~/config
+cat > $STPKG_CONF_FILE << EOF
+# Please, only modify the 'STPKG_TOKEN'
+if [ ! "x\$INSTALL" = "xyes" ]; then
+STPKG_BASE="$BASE_DIR"
+STPKG_HOMESERV='matrix.org'
+STPKG_TOKEN=''
+STPKG_COLORS='yes'
+STPKG_NO_MSG='no'
+EOF
+    chmod 00600 $STPKG_CONF_FILE
+
+    # Set install dir. Oh boi, tricky things going around here because we
+    # handle the sshfs ourself.
+    if [ ! "x$SSHFS" = "x" ]; then
+        info "Detected a sshfs install"
+        [ "x$MNT" = "x" ] && die "You must specify a mount point with '-local /mount/pount' when using the '-sshfs' option"
+        local STPKG_INSTALL=$1
+        local STPKG_INSTALL=$MNT${STPKG_INSTALL:="/html/stickerpicker/"}
+
+        # The sshfs hook
+cat >> $STPKG_CONF_FILE << EOF
+STPKG_SSHFS='yes'
+STPKG_INSTALL="$STPKG_INSTALL"
+SSHFS_USER="$SSHFS"
+SSHFS_MNT="`echo "$MNT" | sed "s+$HOME+~+g"`"
+mountpoint $MNT >/dev/null 2>&1
+[ \$? -ne 0 -a ! "x\$INSTALL" = "xyes" ] && {
+    [ ! -d "\$STPKG_INSTALL" ] && {
+        sshfs $SSHFS: $MNT \
+            || die "Failed to mount $SSHFS:~/ to $MNT";
+    }
+    [ ! -d "\$STPKG_INSTALL" ] \
+        && die 'Failed to mount $SSHFS:~/ to $MNT, sshfs problems?'
+}
+EOF
+
+        # Do the sshfs hook
+        [ -f "$MNT" ] && die "The destination mount pount already exists"
+        mkdir "$MNT"
+        mountpoint $MNT >/dev/null 2>&1
+        [ $? -eq 0 ] && die "The '$MNT' folder is already a mountpoint"
+        sshfs $SSHFS: $MNT || die "Failed to mount $SSHFS:~/ to $MNT"
+    else
+        local STPKG_INSTALL=$1
+        local STPKG_INSTALL=${STPKG_INSTALL:="~/html/stickerpicker/"}
+        echo "STPKG_INSTALL=$STPKG_INSTALL" >> $STPKG_CONF_FILE
+    fi
+
+    # Check install dir
+    [ -d "$STPKG_INSTALL" ] \
+        && die "Folder '$STPKG_INSTALL' already exists." \
+               "If you already installed the sticker picker you can use '$0 update'"
+
+    # Clone and copy packs
+    info "Will install sticker picker in folder: $STPKG_INSTALL"
+    git clone https://github.com/maunium/stickerpicker.git "$STPKG_INSTALL" \
+        || die "Failed to git clone the stickerpicker project."
+
+    cd $STPKG_INSTALL/   || die "Failed to cd to '$STPKG_INSTALL/'"
+    cp packs/* web/packs || die "Failed to copy default packs to '$STPKG_INSTALL/web/packs/'"
+
+    default_index > $STPKG_INSTALL/web/packs/index.json || die "Failed to create default index.json file"
+
+    echo "fi" >> $STPKG_CONF_FILE
+    info "You may edit the $STPKG_CONF_FILE to setup your home server and token (variable STPKG_TOKEN)"
+}
+if [ "x$1" = "x-install" ]; then
+    [ "x$STPKG_NO_MSG" = "xyes" ] \
+        && echo "!!! STPKG_NO_MSG is turn on, you won't see what's going on during the install"
+    shift
+    REPO_DIR="$(dirname $SELF)"
+    [ "$REPO_DIR" = "$BASE_DIR" ] || die \
+        "You must run this script from the root of the sticker repo." \
+        "You are in '$BASE_DIR' and should be in '$REPO_DIR'"
+    __install $*
+    exit 0
+fi
+
+#########################
+# Get some exec / paths #
+#########################
+
+STPKG_INSTALL=${STPKG_INSTALL:="~/html/stickerpicker/"}
+if [ ! -d "$STPKG_INSTALL" ]; then
+    error "STPKG_INSTALL folder ($STPKG_INSTALL) doesn't exist. Did you use the install script?"
+    usage
+fi
+info "Use STPKG_INSTALL: $STPKG_INSTALL`[ "x$STPKG_SSHFS" = "xyes" ] && echo ' (this is an sshfs install)'`"
+
+[ "x$STPKG_BASE" = "x" ] && die \
+    "The STPKG_BASE env var is mendatory, it must point to the sticker repo. It should have been given by the install script"
+
+#########################
+# Cmd handler functions #
+#########################
+
+__show() {
+    local COLOR_STCOLOR=`[ "x$STPKG_COLORS" = "xyes" ] && echo '__green' || echo '__yellow'`
+    local COLOR_STNOMSG=`[ "x$STPKG_NO_MSG" = "xyes" ] && echo '__green' || echo '__yellow'`
+    local COMMITS=`git -C $STPKG_BASE rev-list --count HEAD 2>/dev/null`
+    local REVISION=`git -C $STPKG_BASE rev-list --count master 2>/dev/null`
+    local REVISION=`expr $COMMITS - $REVISION`
+    local BRANCH=`git -C $STPKG_BASE branch 2>&1 | grep --color=auto "\*" | sed -e "s/* //" -e "s/$/ /"`
+
+    local SAFE=0
+    local UNSAFE=0
+    local UNSAFE_CMD=""
+    for CMD in $REQUIREMENTS; do
+        [[ "`which $CMD`" =~ ^(/usr/bin|/bin|/sbin|/usr/sbin) ]] \
+            && local SAFE=`expr $SAFE + 1` \
+            || {
+                local UNSAFE=`expr $UNSAFE + 1`
+                local UNSAFE_CMD="$CMD $UNSAFE_CMD"
+            }
+    done
+    [ $UNSAFE -gt 0 ] && local UNSAFE=`__yellow $UNSAFE` || local UNSAFE=`__green $UNSAFE`
+
+    if [ "x$STPKG_TOKEN" = "x" ]; then
+        local TOKEN=`__yellow 'absent' `
+    else
+        local TOKEN=`validate_token_internal`
+        case "$TOKEN" in
+            M_UNKNOWN_TOKEN)    local TOKEN=`__red '[invalid token]'`;;
+            M_UNKNOWN)          local TOKEN=`__green '[valid]'`;;
+            *)                  local TOKEN=`__yellow '[unimplemented]'`;;
+        esac
+        local TOKEN="$TOKEN `__red "Sensitive data, I won't show it!"`"
+    fi
+
+    ## SSHFS stuff
+    if [ "x$STPKG_SSHFS" = "xyes" ]; then
+cat << EOF
+`__bold stpkg with sshfs install:`
+    sshfs             `[ -d $STPKG_INSTALL ] && __green 'mounted' || { __yellow 'umounted'; echo " (should not be the case at this point)"; }`
+    user              $SSHFS_USER
+    mountpoint        $SSHFS_MNT
+EOF
+    fi
+
+    ## Version stuff
+cat << EOF
+`__bold stpkg version:`
+    branch            $BRANCH
+    commits           $COMMITS
+    revision          $REVISION
+`__bold stpkg options and variables:`
+    `__green STPKG_INSTALL`     `__italic $STPKG_INSTALL`
+    `__green STPKG_BASE`        `__italic $STPKG_BASE`
+    `__green STPKG_COLORS`      `__italic $($COLOR_STCOLOR $STPKG_COLORS)`
+    `__green STPKG_NO_MSG`      `__italic $($COLOR_STNOMSG $STPKG_NO_MSG)`
+    `__green STPKG_HOMESERV`    `__italic $STPKG_HOMESERV`
+    `__green STPKG_TOKEN`       $TOKEN
+`__bold required commands due to the '"require"' function:`
+    safe (system)     `__green $SAFE`
+    unsafe (user)     $UNSAFE
+EOF
+    [ ! -z "$UNSAFE_CMD" ] && {
+        echo -ne '    '`__yellow unsafe commands`'   '
+        for CMD in $UNSAFE_CMD; do echo -n "$CMD "; done
+        echo ''
+    }
+}
+
+__update() {
+    info "Updating packs..."
+
+    info "... update the sticker repo"
+    local LOCATION_OPT="--git-dir=$STPKG_BASE/.git --work-tree=$STPKG_BASE/"
+    git $LOCATION_OPT fetch  >/dev/null 2>&1 || die "Failed to fetch from sticker repo"
+    git $LOCATION_OPT rebase >/dev/null 2>&1 || die "Failed to rebase... what did you do to your master branch?"
+
+    info "... update the sticker picker repo"
+    local LOCATION_OPT="--git-dir=$STPKG_INSTALL/.git --work-tree=$STPKG_INSTALL/"
+    git $LOCATION_OPT fetch  >/dev/null 2>&1 || die "Failed to fetch from stickerpicker repo"
+    git $LOCATION_OPT rebase >/dev/null 2>&1 || die "Failed to rebase... what did you do to the master branch of the sticker picker?"
+
+    info "... copy the Json pack files in the sticker picker folder"
+    cp $STPKG_BASE/packs/*/*.json $STPKG_INSTALL/web/packs/ || die "Failed to copy packs Json files"
+
+    local NEW_MD5=`md5sum $(readlink -f "$STPKG_BASE/stpkg")`
+    if [ ! "$NEW_MD5" = "$MD5" ]; then
+        info "... creating update script"
+        local UPDATE=`mktemp --suffix=.sh`
+cat > $UPDATE << EOF
+`declare -f __yellow`
+`declare -f __green`
+`declare -f __red`
+`declare -f die`
+__yellow "... Update stpkg ... "
+cp "$STPKG_BASE/stpkg" "$SELF" && __green "success!" || __red "failed!"
+rm "$UPDATE" || die "Failed to delete the update script"
+echo ""
+EOF
+        exec bash "$UPDATE" \
+            || die "Failed to run the update script." \
+                   "You will need to copy manually '$STPKG_BASE/stpkg' to '$SELF' manually."
+    fi
+
+    info "Update finished!"
+    exit 0
+}
+
+__display() {
+    if [ "x$1" = "x-dl" ]; then
+        local DL_SWITCH="yes"
+        local DL_FOLDER="$2"
+        if [ ! -d "$DL_FOLDER" ]; then
+            info "Need to create folder '$DL_FOLDER'";
+            mkdir "$DL_FOLDER" || die "Failed to create folder '$DL_FOLDER'";
+        else
+            warn "Folder '$DL_FOLDER' already exists"
+        fi
+        info "Will use the '$DL_FOLDER' to dl found stickers"
+        shift 2
+    fi
+
+    local FILE="${STPKG_INSTALL}web/packs/$1.json"
+    [ ! -r "$FILE" ] && die "Pack '$1' is not available (check with 'pack list'). The corresponfig file should be '$FILE'"
+    echo "Display the sticker pack $(__green `jq '.title' < "$FILE"`):"
+
+    local FIRST="yes"
+    jq '.stickers[] | "\(.body) \(.info.thumbnail_url) \(.info.mimetype)"' < "$FILE" | while IFS= read LINE; do
+        local NAME=`echo "$LINE" | awk -F '"| ' '{print $2}'`
+        local URL=` echo "$LINE" | awk -F '"| ' '{print $3}'`
+        local TYPE=`echo "$LINE" | awk -F '"| ' '{print $4}' | awk -F '/' '{print $2}'`
+        [ ! "x$2" = "x" ] && { [[ "$NAME" =~ $2 ]] || continue; }
+        local URL=`mxc_to_https "$URL"`
+
+        # Header if first
+        if [ "x$FIRST" = "xyes" ]; then
+            local FIRST="no"
+            echo "Name Download_URL Type"
+        fi
+
+        echo -ne "$NAME $URL $TYPE"
+        if [ "x$DL_SWITCH" = "xyes" ]; then
+            curl "$URL" --create-dirs --output "$DL_FOLDER/$NAME.$TYPE" >/dev/null 2>&1 \
+                && echo " `__green DL`" \
+                || echo " `__red Failed`"
+        else
+            echo ""
+        fi
+    done | column -t
+}
+
+__list() {
+    # Handle -e and -p flags
+    local PARSE_FLAGS=1
+    while [ $PARSE_FLAGS -eq 1 ]; do
+        case "$1" in
+            -e)
+                local FILTER_ENABLED="yes"
+                shift
+                ;;
+            -ne)
+                local FILTER_DISABLED="yes"
+                shift
+                ;;
+            -np)
+                local FILTER_NOT_PRESENT="yes"
+                shift
+                ;;
+            -p)
+                local FILTER_PRESENT="yes"
+                shift
+                ;;
+            *)
+                local PARSE_FLAGS=0
+                ;;
+        esac
+    done
+
+    [ "x$FILTER_PRESENT" = "xyes" -a "x$FILTER_NOT_PRESENT" = "xyes" ] \
+        && die "The -p and -np flags are incompatible"
+    [ "x$FILTER_ENABLED" = "xyes" -a "x$FILTER_DISABLED" = "xyes" ] \
+        && die "The -e and -ne flags are incompatible"
+
+    # Get the regex
+    local REG="$*"
+
+    # A sticker pack can be:
+    # - enabled and present in the picker folder
+    # - disabled and present in the picker folder
+    # - orphan when the Json file is present in the picker folder but not in the pack repo
+    # Note that the Json files from the sticker repo are copied at update time
+    # in the sticker repo picker folder.
+    # A pack can be 'orphan' and 'enabled', or 'orphan' and 'disabled'. But
+    # 'enabled' and 'disabled' are exclusive tags.
+
+    ls -d1 $STPKG_INSTALL/web/packs/*.json | grep -v index.json | while IFS= read -r LINE; do
+        local LINE=`basename $LINE .json`
+
+        [ ! "x$REG" = "x" ] && ! [[ "$LINE" =~ $REG ]] && continue
+
+        local PRESENT=`find $STPKG_BASE/packs/ -type f -name "$LINE.json"`
+        [ "x$FILTER_PRESENT"     = "xyes" -a   "x$PRESENT" = "x" ] && continue
+        [ "x$FILTER_NOT_PRESENT" = "xyes" -a ! "x$PRESENT" = "x" ] && continue
+        local PRESENT=`[ ! "x$PRESENT" = "x" ] && echo 'p' || echo 'a'`
+
+        local ENABLED=`jq -r ".packs | index(\"$LINE.json\") | ." < $STPKG_INSTALL/web/packs/index.json`
+        [ "x$FILTER_ENABLED"  = "xyes" -a   "x$ENABLED" = "xnull" ] && continue
+        [ "x$FILTER_DISABLED" = "xyes" -a ! "x$ENABLED" = "xnull" ] && continue
+        local ENABLED=`[ "x$ENABLED" = "xnull" ] && echo 'd' || echo 'e'`
+
+        echo -ne "$PRESENT$ENABLED $LINE\n"
+    done
+}
+
+__edit() {
+    # <pack name> <add|del> <sticker> [image file to use]
+    local PACK_NAME="$1"
+    local ACTION="$2"
+    local STICKER_NAME="$3"
+    [ -z "$PACK_NAME" -o -z "$ACTION" -o -z "$STICKER_NAME" ] && die "Command argument are invalid, check the usage"
+    shift 3
+
+    local JSON_FILE="${STPKG_INSTALL}web/packs/$PACK_NAME.json"
+    [ ! -r "$JSON_FILE" ] && die "Can't read file '$JSON_FILE' associated to the '$PACK_NAME' pack"
+
+    local TEMP=`mktemp --suffix=.stpkg`
+    cp $JSON_FILE $TEMP
+
+    case "$ACTION" in
+        add)
+            [ $# -eq 0 ] && die "You must specify an image file for the add action"
+            local FILE="$1"
+            [ ! -r "$FILE" ] && die "Failed to find file '$FILE'"
+
+            validate_homeserv   # Check if homeserv exists (see __pack)
+            validate_token      # Validate token, will exit if invalid (see __pack)
+
+            # Get sizes (see __pack)
+            local WIDTH=$(file_get_width "$FILE")
+            local HEIGHT=$(file_get_height "$FILE")
+            local TYPE=$(file_get_type "$FILE")
+            local NAME=$(file_get_name "$FILE")
+            local DEST=$(mktemp --suffix=".$TYPE")
+
+            picture_process_sticker "$FILE" "$DEST" "$NAME" "$WIDTH" "$HEIGHT" "$TYPE"  # Transform sticker picture (see __pack)
+            local MXC=$(upload_file "$TYPE" "$DEST" "$NAME")                            # Upload transformed file (see __pack)
+
+            jq "del(.stickers[] | select(.body == \"$STICKER_NAME\"))" < "$TEMP" | sponge "$TEMP"
+            local ST_JSON=$(create_sticker_json "$PACK_NAME" "$NAME" "$WIDTH" "$HEIGHT" "$TYPE" "$MXC")
+            jq ".stickers += [$ST_JSON]" < $TEMP | sponge $TEMP
+            ;;
+
+        del)
+            [ $# -ne 0 ] && die "Extra argument are present: $*"
+            jq "del(.stickers[] | select(.body == \"$STICKER_NAME\"))" < "$TEMP" | sponge "$TEMP"
+            ;;
+
+        *)
+            die "Unknown action '$ACTION', should be 'add' or 'del'"
+            ;;
+    esac
+
+    # TODO [OPTIONAL] Update the preview
+    # TODO Add a dry mode, to only preview the change
+    # TODO If the pack was already added to the picker, re-add it to take into
+    #      account the modifications
+    #jq < $TEMP ### to test/review the change
+    cp $TEMP $JSON_FILE
+}
+
+__add() {
+    [ "x$1" = "x" ] && die "You must specify a pack for the 'add' command"
+    info "Enable pack '$1'"
+
+    local PRESENT=`find $STPKG_INSTALL/web/packs/ -type f -name "$1.json" | grep -v index.json`
+    [ "x$PRESENT" = "x" ] && die "Pack '$1' is not present"
+
+    # Use a temp file because of sponge
+    local TEMP=`mktemp --suffix=.stpkg`
+    cp $STPKG_INSTALL/web/packs/index.json $TEMP
+    jq ".packs += [\"$1.json\"]" < $TEMP | sponge $TEMP
+    cp $TEMP $STPKG_INSTALL/web/packs/index.json
+}
+
+__del() {
+    [ "x$1" = "x" ] && die "You must specify a pack 'del' command"
+    info "Disable pack '$1'"
+    local TEMP=`mktemp --suffix=.stpkg`
+    cp $STPKG_INSTALL/web/packs/index.json $TEMP
+    jq "{ \"homeserver_url\": .homeserver_url, \"packs\": .packs | map(select(. != \"$1.json\")) }" \
+        < $TEMP | sponge $TEMP
+    cp $TEMP $STPKG_INSTALL/web/packs/index.json
+}
+
+__default() {
+    info "Reset the index.json in the sticker picker install directory"
+    default_index > $STPKG_INSTALL/web/packs/index.json || die "Failed to create default index.json file"
+}
+
+progress()       { echo 1>&2 -n "$*";       }
+progress_dot()   { progress '.';            }
+progress_reset() { echo 1>&2 -en "\r[2K"; }
+__pack() {
+    validate_homeserv # Check if homeserv exists
+
+    # Get the token
+    if [ "x$1" = "x-t" ]; then
+        STPKG_TOKEN="$2"
+        shift 2
+    fi
+    if [ "x$STPKG_TOKEN" = "x" ]; then
+        read -sp "`__yellow 'Enter your access token:'`" STPKG_TOKEN
+        echo ''
+    fi
+
+    validate_token # Validate token, will exit if invalid
+
+    # The pack source folder and the pack name
+    if [ $# -eq 1 ]; then
+        # The pack name is not specified
+        local PACK_FOLDER="$1"
+        local PACK_NAME=${PACK_FOLDER##*/}
+    else if [ $# -eq 2 ]; then
+        # The pack name is specified
+        local PACK_NAME="$1"
+        local PACK_FOLDER="$2"
+    else
+        die "Invalid number of arguments for the 'pack' command"
+    fi fi
+    local PACK_NAME=`slugify $PACK_NAME`
+    info "Will pack the folder '$PACK_FOLDER' into '$PACK_NAME'"
+    [ ! -d "$PACK_FOLDER" ] && die "Source folder '$PACK_FOLDER' doesn't exsit"
+
+    # Check packs
+    local DEST_FOLDER="$STPKG_BASE/packs/$PACK_NAME"
+    [ -d "$DEST_FOLDER" ] \
+        && { { warn "Delete old folder content for pack $PACK_NAME" ; rm "$DEST_FOLDER"/*; } \
+           || die "Failed to remove old folder pack content"; } \
+        || { { info "Create folder for pack $PACK_NAME" ; mkdir "$DEST_FOLDER"; } \
+           || die "Failed to create destination folder for pack '$PACK_NAME'"; }
+    local DEST_INDEX="$DEST_FOLDER/$PACK_NAME.json"
+    touch $DEST_INDEX
+    [ ! -f $DEST_INDEX ] && die "Failed to create the index file '$DEST_INDEX'"
+
+    # Populate all stickers
+    echo -n "{\"title\":\"$PACK_NAME\",\"id\":\"`uuidgen`\",\"stickers\":[" > $DEST_INDEX
+
+    cd $PACK_FOLDER
+    local TOTAL_FILES=`find . -maxdepth 1 -type f | wc -l`
+    local CURRENT_FILE=1
+    local FIRST_IN_ARRAY=""
+    for FILE in *; do
+        # In this loop, results are on stdout and progress on stderr. Note that
+        # if the stderr of stpkg is redirected, progress messages will be lost.
+
+        # Get sizes
+        local WIDTH=$(file_get_width "$FILE")
+        local HEIGHT=$(file_get_height "$FILE")
+
+        # Get the names and extentions
+        local TYPE=$(file_get_type "$FILE")
+        local NAME=$(file_get_name "$FILE")
+        local DEST="$DEST_FOLDER/$NAME.$TYPE"
+
+        # For the progress
+        progress "($CURRENT_FILE/$TOTAL_FILES) $NAME "
+        local CURRENT_FILE=$[ $CURRENT_FILE + 1 ]
+
+        # Transform sticker source picture
+        picture_process_sticker "$FILE" "$DEST" "$NAME" "$WIDTH" "$HEIGHT" "$TYPE"
+
+        # Add a ',' only if it's not the first in the array
+        echo -n "$FIRST_IN_ARRAY" >> $DEST_INDEX
+
+        # Upload the transformed file
+        local MXC=$(upload_file "$TYPE" "$DEST" "$NAME")
+        progress_dot
+
+        # Calculate the 128x128 format
+        local INIT_WIDTH=$WIDTH
+        local INIT_HEIGHT=$HEIGHT
+        picture_resize_preview "$DEST" "$NAME"
+        local WIDTH=$( identify -format "%w" "$DEST[0]") >/dev/null
+        local HEIGHT=$(identify -format "%h" "$DEST[0]") >/dev/null
+
+        # Add the sticker to the index file
+        create_sticker_json "$PACK_NAME" "$NAME" "$WIDTH" "$HEIGHT" "$TYPE" "$MXC" >> $DEST_INDEX
+
+        # For the report
+        [ "x$FIRST_IN_ARRAY" = "x" ] && echo -e "StickerName MXC Type Width Height"
+        local FIRST_IN_ARRAY=","
+        echo -e "$NAME ($MXC) $TYPE $INIT_WIDTH $INIT_HEIGHT"
+
+        progress_reset
+    done | column -t
+
+    # Create the preview
+    montage "$DEST_FOLDER/*.{png,gif}" -background none "$DEST_FOLDER/preview.png"
+    echo -ne "# $PACK_NAME\n![Preview of $PACK_NAME](preview.png)" > "$DEST_FOLDER/README.md"
+    find $DEST_FOLDER -type f \( ! -name "preview.png" -and ! -name "$PACK_NAME.json" \) -exec rm {} \;
+
+    echo -n "]}" >> $DEST_INDEX
+    info "Pack created, you can now commit it and create a MR to share it with other users"
+}
+
+######################
+# Parse command line #
+######################
+
+[ "x$1" = "x" ] && usage
+case "$1" in
+    show)               __show      ;;
+    update)             __update    ;;
+    list)       shift;  __list $*   ;;
+    add)        shift;  __add $*    ;;
+    del)        shift;  __del $*    ;;
+    default)            __default   ;;
+    pack)       shift;  __pack $*   ;;
+    display)    shift;  __display $*;;
+    edit)       shift;  __edit $*   ;;
+    *)                  usage       ;;
+esac
