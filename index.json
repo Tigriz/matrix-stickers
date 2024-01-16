@@ -1,23 +1,6 @@
 {
-  "homeserver_url": "https://matrix.iiens.net",
+  "homeserver_url": "https://matrix.helianthine.solar",
   "packs": [
-    "pack-random.json",
-    "pepe.json",
-    "fachosphere.json",
-    "star-wars.json",
-    "wojak.json",
-    "jouker.json",
-    "macron-demon.json",
-    "pepetop.json",
-    "scalar-isabella.json",
-    "scalar-privacy_pam.json",
-    "pack-magicienne-des-tenebres.json",
-    "pack-fire-emblem.json",
-    "fe-edelgard.json",
-    "fe-hilda.json",
-    "fe-anna.json",
-    "fe-marianne.json",
-    "fe-dorothea.json",
-    "pack-little-witch-academia.json"
+    "https://git.iiens.net/Elliu/matrix-stickers/-/raw/master/packs/vampeerz/vampeerz.json"
   ]
 }
