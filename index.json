@@ -1,6 +1,6 @@
 {
   "homeserver_url": "https://matrix.helianthine.solar",
   "packs": [
-    "https://git.iiens.net/Elliu/matrix-stickers/-/raw/master/packs/vampeerz/vampeerz.json"
+    "https://raw.githubusercontent.com/Tigriz/matrix-stickers/main/packs/vampeerz.json"
   ]
 }
